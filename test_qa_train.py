@@ -4,18 +4,17 @@
 # ============================================
 # Кастомный Transformer для question -> answer
 # Датасет: Den4ikAI/russian_dialogues
-# Минимальные изменения от оригинального кода
+# Vocab строится на всём train, с кэшированием и tqdm
 # ============================================
 
 # Если вы запускаете в Colab/Jupyter и нужны совместимые версии:
 # !apt install --allow-change-held-packages libcudnn8=8.1.0.77-1+cuda11.2
 # !pip uninstall -y -q tensorflow keras tensorflow-estimator tensorflow-text
 # !pip install protobuf~=3.20.3
-# !pip install -q -U tensorflow-text tensorflow datasets
+# !pip install -q -U tensorflow-text tensorflow datasets loguru tqdm
 
-import time
+import os
 import numpy as np
-import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow_text as text
 import re
@@ -23,10 +22,18 @@ import pathlib
 import warnings
 
 from loguru import logger
+from tqdm.auto import tqdm
 from datasets import load_dataset
 from tensorflow_text.tools.wordpiece_vocab import bert_vocab_from_dataset as bert_vocab
 
 warnings.filterwarnings("ignore")
+
+# --------------------------------------------
+# Пути к vocab-файлам
+# --------------------------------------------
+
+QUESTION_VOCAB_PATH = "question_vocab.txt"
+ANSWER_VOCAB_PATH = "answer_vocab.txt"
 
 # ============================================
 # 1. Загрузка датасета
@@ -39,8 +46,8 @@ dataset = dataset.train_test_split(test_size=0.01, seed=42)
 train_hf = dataset["train"]
 val_hf = dataset["test"]
 
-logger.info(f"Размер обучающей выборки: {len(train_hf)}")
-logger.info(f"Размер валидационной выборки: {len(val_hf)}")
+logger.info(f"Размер обучающей выборки (HF): {len(train_hf)}")
+logger.info(f"Размер валидационной выборки (HF): {len(val_hf)}")
 
 
 def normalize_text(x):
@@ -58,6 +65,7 @@ def example_generator(hf_ds):
         yield q, a
 
 
+# tf.data.Dataset c очищенными парами question/answer
 train_examples = tf.data.Dataset.from_generator(
     lambda: example_generator(train_hf),
     output_signature=(
@@ -74,6 +82,7 @@ val_examples = tf.data.Dataset.from_generator(
     ),
 )
 
+# Примеры
 for q_examples, a_examples in train_examples.batch(3).take(1):
     logger.info("Примеры вопросов:")
     for q in q_examples.numpy():
@@ -83,10 +92,10 @@ for q_examples, a_examples in train_examples.batch(3).take(1):
         logger.info(a.decode("utf-8"))
 
 # ============================================
-# 2. Токенизация
+# 2. Токенизация + построение vocab
 # ============================================
 
-VOCAB_SIZE = 8000
+VOCAB_SIZE = 28000
 bert_tokenizer_params = dict(lower_case=True)
 reserved_tokens = ["[PAD]", "[UNK]", "[START]", "[END]"]
 
@@ -97,29 +106,70 @@ bert_vocab_args = dict(
     learn_params={},
 )
 
-# Для минимальных изменений сохраняем две ветки: "question" и "answer"
-train_questions = train_examples.map(lambda q, a: q)
-train_answers = train_examples.map(lambda q, a: a)
-
-logger.info("Строим словарь вопросов...")
-question_vocab = bert_vocab.bert_vocab_from_dataset(
-    train_questions.batch(1000).prefetch(2), **bert_vocab_args
-)
-
-logger.info("Строим словарь ответов...")
-answer_vocab = bert_vocab.bert_vocab_from_dataset(
-    train_answers.batch(1000).prefetch(2), **bert_vocab_args
-)
-
 
 def write_vocab_file(filepath, vocab):
     with open(filepath, "w", encoding="utf-8") as f:
         for token in vocab:
-            print(token, file=f)
+            f.write(token + "\n")
 
 
-write_vocab_file("question_vocab.txt", question_vocab)
-write_vocab_file("answer_vocab.txt", answer_vocab)
+def read_vocab_file(filepath):
+    with open(filepath, encoding="utf-8") as f:
+        return [line.rstrip("\n") for line in f]
+
+
+def build_vocab_with_tqdm(train_ds, which="question"):
+    """
+    Копирует весь поток train_ds (одна колонка: либо вопросы, либо ответы)
+    в список строк с tqdm, затем строит tf.data.Dataset.from_tensor_slices
+    и уже по нему вызывает bert_vocab_from_dataset.
+    """
+    texts = []
+    logger.info(f"Копируем все {which} для построения vocab с tqdm...")
+
+    for batch in tqdm(train_ds.batch(1024), desc=f"Collect {which} text"):
+        for t in batch.numpy():
+            texts.append(t.decode("utf-8"))
+
+    logger.info(
+        f"Собрано {len(texts)} строк для {which}-vocab. Стартуем bert_vocab_from_dataset..."
+    )
+
+    ds = tf.data.Dataset.from_tensor_slices(tf.constant(texts, dtype=tf.string))
+    vocab = bert_vocab.bert_vocab_from_dataset(
+        ds.batch(1000).prefetch(2),
+        **bert_vocab_args,
+    )
+    return vocab
+
+
+def maybe_build_or_load_vocab(train_examples):
+    """
+    Если vocab-файлы есть — читаем их.
+    Если нет — строим оба словаря (question/answer) на полном train_examples с tqdm и сохраняем.
+    """
+    if os.path.exists(QUESTION_VOCAB_PATH) and os.path.exists(ANSWER_VOCAB_PATH):
+        logger.info("Найдены существующие vocab-файлы, пропускаем обучение vocab.")
+        question_vocab = read_vocab_file(QUESTION_VOCAB_PATH)
+        answer_vocab = read_vocab_file(ANSWER_VOCAB_PATH)
+    else:
+        logger.info("Vocab-файлы не найдены, строим с нуля на всём train.")
+
+        train_questions = train_examples.map(lambda q, a: q)
+        train_answers = train_examples.map(lambda q, a: a)
+
+        question_vocab = build_vocab_with_tqdm(train_questions, which="question")
+        answer_vocab = build_vocab_with_tqdm(train_answers, which="answer")
+
+        write_vocab_file(QUESTION_VOCAB_PATH, question_vocab)
+        write_vocab_file(ANSWER_VOCAB_PATH, answer_vocab)
+        logger.info("Словари сохранены на диск.")
+
+    return question_vocab, answer_vocab
+
+
+# Строим или загружаем vocab
+question_vocab, answer_vocab = maybe_build_or_load_vocab(train_examples)
 
 logger.info("Фрагменты question_vocab:")
 logger.info(str(question_vocab[:20]))
@@ -129,27 +179,9 @@ logger.info("Фрагменты answer_vocab:")
 logger.info(str(answer_vocab[:20]))
 logger.info(str(answer_vocab[100:120]))
 
-question_tokenizer = text.BertTokenizer("question_vocab.txt", **bert_tokenizer_params)
-answer_tokenizer = text.BertTokenizer("answer_vocab.txt", **bert_tokenizer_params)
+question_tokenizer = text.BertTokenizer(QUESTION_VOCAB_PATH, **bert_tokenizer_params)
+answer_tokenizer = text.BertTokenizer(ANSWER_VOCAB_PATH, **bert_tokenizer_params)
 
-# Посмотрим длины
-lengths = []
-for q_examples, a_examples in train_examples.batch(1024).take(200):
-    q_tokens = question_tokenizer.tokenize(q_examples)
-    lengths.append(q_tokens.row_lengths())
-    a_tokens = answer_tokenizer.tokenize(a_examples)
-    lengths.append(a_tokens.row_lengths())
-
-all_lengths = np.concatenate([x.numpy() for x in lengths])
-
-plt.hist(all_lengths, np.linspace(0, 100, 101))
-plt.ylim(plt.ylim())
-max_length = max(all_lengths)
-plt.plot([max_length, max_length], plt.ylim())
-plt.title(f"Максимальное количество токенов в примере: {max_length}")
-plt.show()
-
-# Для коротких диалоговых фраз разумно взять 40-64
 MAX_TOKENS = 40
 
 START = tf.argmax(tf.constant(reserved_tokens) == "[START]")
@@ -181,6 +213,7 @@ class CustomTokenizer(tf.Module):
 
         vocab = pathlib.Path(vocab_path).read_text(encoding="utf-8").splitlines()
         self.vocab = tf.Variable(vocab)
+        self._vocab_size = len(vocab)
 
         self.tokenize.get_concrete_function(
             tf.TensorSpec(shape=[None], dtype=tf.string)
@@ -222,7 +255,8 @@ class CustomTokenizer(tf.Module):
 
     @tf.function
     def get_vocab_size(self):
-        return tf.shape(self.vocab)[0]
+        # вернуть скаляр tf.int32
+        return tf.constant(self._vocab_size, dtype=tf.int32)
 
     @tf.function
     def get_vocab_path(self):
@@ -234,14 +268,14 @@ class CustomTokenizer(tf.Module):
 
 
 tokenizers = tf.Module()
-tokenizers.question = CustomTokenizer(reserved_tokens, "question_vocab.txt")
-tokenizers.answer = CustomTokenizer(reserved_tokens, "answer_vocab.txt")
+tokenizers.question = CustomTokenizer(reserved_tokens, QUESTION_VOCAB_PATH)
+tokenizers.answer = CustomTokenizer(reserved_tokens, ANSWER_VOCAB_PATH)
 
 model_name = "russian_dialogues_qa_converter"
 logger.info(f"Сохраняем токенизаторы в SavedModel: {model_name}")
 tf.saved_model.save(tokenizers, model_name)
 
-# Проверка токенизации
+# Проверка токенизации (маленький батч)
 for q_examples, a_examples in train_examples.batch(3).take(1):
     encoded = tokenizers.question.tokenize(q_examples)
     logger.info("Токенизация вопросов:")
@@ -311,7 +345,6 @@ def positional_encoding(length, depth):
     angle_rads = positions * angle_rates
 
     pos_encoding = np.concatenate([np.sin(angle_rads), np.cos(angle_rads)], axis=-1)
-
     return tf.cast(pos_encoding, dtype=tf.float32)
 
 
@@ -346,7 +379,6 @@ class CrossAttention(BaseAttention):
         attn_output, attn_scores = self.mha(
             query=x, key=context, value=context, return_attention_scores=True
         )
-
         self.last_attn_scores = attn_scores
         x = self.add([x, attn_output])
         x = self.layernorm(x)
@@ -391,11 +423,9 @@ class FeedForward(tf.keras.layers.Layer):
 class EncoderLayer(tf.keras.layers.Layer):
     def __init__(self, *, d_model, num_heads, dff, dropout_rate=0.1):
         super().__init__()
-
         self.self_attention = GlobalSelfAttention(
             num_heads=num_heads, key_dim=d_model, dropout=dropout_rate
         )
-
         self.ffn = FeedForward(d_model, dff, dropout_rate=dropout_rate)
 
     def call(self, x):
@@ -409,49 +439,40 @@ class Encoder(tf.keras.layers.Layer):
         self, *, num_layers, d_model, num_heads, dff, vocab_size, dropout_rate=0.1
     ):
         super().__init__()
-
         self.d_model = d_model
         self.num_layers = num_layers
 
         self.pos_embedding = PositionalEmbedding(vocab_size=vocab_size, d_model=d_model)
-
         self.enc_layers = [
             EncoderLayer(
                 d_model=d_model, num_heads=num_heads, dff=dff, dropout_rate=dropout_rate
             )
             for _ in range(num_layers)
         ]
-
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
 
     def call(self, x):
         x = self.pos_embedding(x)
         x = self.dropout(x)
-
         for i in range(self.num_layers):
             x = self.enc_layers[i](x)
-
         return x
 
 
 class DecoderLayer(tf.keras.layers.Layer):
     def __init__(self, *, d_model, num_heads, dff, dropout_rate=0.1):
         super(DecoderLayer, self).__init__()
-
         self.causal_self_attention = CausalSelfAttention(
             num_heads=num_heads, key_dim=d_model, dropout=dropout_rate
         )
-
         self.cross_attention = CrossAttention(
             num_heads=num_heads, key_dim=d_model, dropout=dropout_rate
         )
-
         self.ffn = FeedForward(d_model, dff, dropout_rate=dropout_rate)
 
     def call(self, x, context):
         x = self.causal_self_attention(x=x)
         x = self.cross_attention(x=x, context=context)
-
         self.last_attn_scores = self.cross_attention.last_attn_scores
         x = self.ffn(x)
         return x
@@ -462,30 +483,24 @@ class Decoder(tf.keras.layers.Layer):
         self, *, num_layers, d_model, num_heads, dff, vocab_size, dropout_rate=0.1
     ):
         super(Decoder, self).__init__()
-
         self.d_model = d_model
         self.num_layers = num_layers
 
         self.pos_embedding = PositionalEmbedding(vocab_size=vocab_size, d_model=d_model)
-
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
-
         self.dec_layers = [
             DecoderLayer(
                 d_model=d_model, num_heads=num_heads, dff=dff, dropout_rate=dropout_rate
             )
             for _ in range(num_layers)
         ]
-
         self.last_attn_scores = None
 
     def call(self, x, context):
         x = self.pos_embedding(x)
         x = self.dropout(x)
-
         for i in range(self.num_layers):
             x = self.dec_layers[i](x, context)
-
         self.last_attn_scores = self.dec_layers[-1].last_attn_scores
         return x
 
@@ -503,7 +518,6 @@ class Transformer(tf.keras.Model):
         dropout_rate=0.1,
     ):
         super().__init__()
-
         self.encoder = Encoder(
             num_layers=num_layers,
             d_model=d_model,
@@ -512,7 +526,6 @@ class Transformer(tf.keras.Model):
             vocab_size=input_vocab_size,
             dropout_rate=dropout_rate,
         )
-
         self.decoder = Decoder(
             num_layers=num_layers,
             d_model=d_model,
@@ -521,22 +534,17 @@ class Transformer(tf.keras.Model):
             vocab_size=target_vocab_size,
             dropout_rate=dropout_rate,
         )
-
-        self.final_layer = tf.keras.layers.Dense(target_vocab_size)
+        self.final_layer = tf.keras.layers.Dense(int(target_vocab_size))
 
     def call(self, inputs):
         context, x = inputs
-
         context = self.encoder(context)
         x = self.decoder(x, context)
-
         logits = self.final_layer(x)
-
         try:
             del logits._keras_mask
         except AttributeError:
             pass
-
         return logits
 
 
@@ -549,15 +557,18 @@ d_model = 128
 dff = 512
 num_heads = 8
 dropout_rate = 0.1
-EPOCHS = 10
+EPOCHS = 2
+
+input_vocab_size = int(tokenizers.question.get_vocab_size().numpy())
+target_vocab_size = int(tokenizers.answer.get_vocab_size().numpy())
 
 transformer = Transformer(
     num_layers=num_layers,
     d_model=d_model,
     num_heads=num_heads,
     dff=dff,
-    input_vocab_size=tokenizers.question.get_vocab_size().numpy(),
-    target_vocab_size=tokenizers.answer.get_vocab_size().numpy(),
+    input_vocab_size=input_vocab_size,
+    target_vocab_size=target_vocab_size,
     dropout_rate=dropout_rate,
 )
 
@@ -575,18 +586,14 @@ logger.info(f"attn_scores.shape: {attn_scores.shape}")
 class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, d_model, warmup_steps=4000):
         super().__init__()
-
-        self.d_model = d_model
-        self.d_model = tf.cast(self.d_model, tf.float32)
+        self.d_model = tf.cast(d_model, tf.float32)
         self.warmup_steps = warmup_steps
 
     def __call__(self, step):
         step = tf.cast(step, dtype=tf.float32)
         step = tf.maximum(step, 1.0)
-
         arg1 = tf.math.rsqrt(step)
         arg2 = step * (self.warmup_steps**-1.5)
-
         return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
 
 
@@ -603,10 +610,8 @@ def masked_loss(label, pred):
         from_logits=True, reduction="none"
     )
     loss = loss_object(label, pred)
-
     mask = tf.cast(mask, dtype=loss.dtype)
     loss *= mask
-
     loss = tf.reduce_sum(loss) / tf.reduce_sum(mask)
     return loss
 
@@ -614,15 +619,11 @@ def masked_loss(label, pred):
 def masked_accuracy(label, pred):
     pred = tf.argmax(pred, axis=2)
     label = tf.cast(label, pred.dtype)
-
     match = label == pred
     mask = label != 0
-
     match = match & mask
-
     match = tf.cast(match, dtype=tf.float32)
     mask = tf.cast(mask, dtype=tf.float32)
-
     return tf.reduce_sum(match) / tf.reduce_sum(mask)
 
 
@@ -643,7 +644,6 @@ class Translator(tf.Module):
 
     def __call__(self, sentence, max_length=MAX_TOKENS):
         assert isinstance(sentence, tf.Tensor)
-
         if len(sentence.shape) == 0:
             sentence = sentence[tf.newaxis]
 
@@ -660,17 +660,13 @@ class Translator(tf.Module):
         for i in tf.range(max_length):
             output = tf.transpose(output_array.stack())
             predictions = self.transformer([encoder_input, output], training=False)
-
             predictions = predictions[:, -1:, :]
             predicted_id = tf.argmax(predictions, axis=-1)
-
             output_array = output_array.write(i + 1, predicted_id[0])
-
             if tf.reduce_all(tf.equal(predicted_id, end)):
                 break
 
         output = tf.transpose(output_array.stack())
-
         text = self.tokenizers.answer.detokenize(output)[0]
         tokens = self.tokenizers.answer.lookup(output)[0]
 
@@ -683,8 +679,8 @@ class Translator(tf.Module):
 translator = Translator(tokenizers, transformer)
 
 
-def print_answer(question, predicted_answer, ground_truth):
-    logger.info(f'{"Вопрос":25s}: {question}')
+def print_answer(question_str, predicted_answer, ground_truth):
+    logger.info(f'{"Вопрос":25s}: {question_str}')
     logger.info(
         f'{"Предсказанный ответ":25s}: {predicted_answer.numpy().decode("utf-8")}'
     )
@@ -698,7 +694,6 @@ bad_empty = 0
 for row in train_hf.select(range(min(200000, len(train_hf)))):
     q = row.get("question")
     a = row.get("answer")
-
     if q is None:
         bad_q += 1
     if a is None:
@@ -710,68 +705,17 @@ logger.info(f"bad_q = {bad_q}")
 logger.info(f"bad_a = {bad_a}")
 logger.info(f"bad_empty = {bad_empty}")
 
-# Несколько примеров из датасета
 samples = train_hf.select(range(5))
 
 for sample in samples:
     q = sample["question"]
     gt = sample["answer"]
-
     predicted_text, predicted_tokens, attention_weights = translator(tf.constant(q))
     print_answer(q, predicted_text, gt)
     logger.info("-" * 80)
 
 # ============================================
-# 7. Визуализация внимания
-# ============================================
-
-
-def plot_attention_head(in_tokens, translated_tokens, attention):
-    translated_tokens = translated_tokens[1:]
-
-    ax = plt.gca()
-    ax.matshow(attention)
-
-    ax.set_xticks(range(len(in_tokens)))
-    ax.set_yticks(range(len(translated_tokens)))
-
-    labels = [label.decode("utf-8") for label in in_tokens.numpy()]
-    ax.set_xticklabels(labels, rotation=90)
-
-    labels = [label.decode("utf-8") for label in translated_tokens.numpy()]
-    ax.set_yticklabels(labels)
-
-
-def plot_attention_weights(sentence, translated_tokens, attention_heads):
-    in_tokens = tf.convert_to_tensor([sentence])
-    in_tokens = tokenizers.question.tokenize(in_tokens).to_tensor()
-    in_tokens = tokenizers.question.lookup(in_tokens)[0]
-
-    fig = plt.figure(figsize=(16, 8))
-
-    for h, head in enumerate(attention_heads):
-        ax = fig.add_subplot(2, 4, h + 1)
-        plot_attention_head(in_tokens, translated_tokens, head)
-        ax.set_xlabel(f"Head {h + 1}")
-
-    plt.tight_layout()
-    plt.show()
-
-
-# Пример внимания
-sample_question = "как дела?"
-predicted_text, predicted_tokens, attention_weights = translator(
-    tf.constant(sample_question)
-)
-
-logger.info("Пример ответа:")
-logger.info(f"Вопрос: {sample_question}")
-logger.info(f"Ответ : {predicted_text.numpy().decode('utf-8')}")
-
-plot_attention_weights(sample_question, predicted_tokens, attention_weights[0])
-
-# ============================================
-# 8. Экспорт модели
+# 7. Экспорт модели
 # ============================================
 
 
