@@ -13,7 +13,7 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        python = pkgs.python313;
+        python = pkgs.python311;
 
         pythonEnv = python.withPackages (ps: with ps; [
           uv
