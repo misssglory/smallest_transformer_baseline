@@ -1,5 +1,5 @@
 {
-  description = "Python dev env (uv, TF, OpenCV, VSCodium, Vim-like UX)";
+  description = "Python 3.11 dev env (uv, TF via pip, OpenCV, VSCodium, Vim-like UX)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -13,36 +13,11 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
+        # Используем Python 3.11 из nixpkgs — TF под него живой
         python = pkgs.python311;
 
-        pythonEnv = python.withPackages (ps: with ps; [
-          uv
-          pip
-          setuptools
-          wheel
-          pyzmq
-          ipykernel
-          jupyter
-          jupyterlab
-          ipywidgets
-          numpy
-          pandas
-          matplotlib
-          seaborn
-          scikit-learn
-          black
-          isort
-          ruff
-          pylint
-          mypy
-          pytest
-          tqdm
-          loguru
-
-          # OpenCV bindings from Nix, не из pip
-          opencv4
-        ]);
-
+        # Только системные библиотеки для Python/TF/OpenCV.
+        # Никаких python.withPackages чтобы не падать на тестах terminado и т.п.
         libPath = pkgs.lib.makeLibraryPath [
           pkgs.stdenv.cc.cc
           pkgs.zeromq
@@ -99,14 +74,14 @@
                   ];
 
                   userSettings = {
-                    # Python / editor
                     "python.defaultInterpreterPath" = "./.venv/bin/python";
                     "python.terminal.activateEnvironment" = true;
                     "python.terminal.activateEnvInCurrentTerminal" = true;
                     "python.terminal.launchArgs" = [ "--no-warnings" ];
+
                     "editor.formatOnSave" = true;
                     "editor.defaultFormatter" = "ms-python.black-formatter";
-                    "editor.lineNumbers" = "relative";  # relative line numbers
+                    "editor.lineNumbers" = "relative";
 
                     "[python]" = {
                       "editor.formatOnSave" = true;
@@ -149,9 +124,7 @@
                     };
                   };
 
-                  # Глобальные keybindings профиля
                   keybindings = [
-                    # History в редакторе
                     {
                       key = "alt+left";
                       command = "workbench.action.navigateBack";
@@ -162,8 +135,6 @@
                       command = "workbench.action.navigateForward";
                       when = "!terminalFocus && canNavigateForward";
                     }
-
-                    # Поведение в терминале: сплиты, как по умолчанию
                     {
                       key = "alt+left";
                       command = "workbench.action.terminal.focusPreviousPane";
@@ -178,8 +149,6 @@
                         "terminalFocus && terminalSplitPaneActive && terminalHasBeenCreated"
                         + " || terminalFocus && terminalSplitPaneActive && terminalProcessSupported";
                     }
-
-                    # Linux default history (пусть живут как запасной вариант)
                     {
                       key = "ctrl+alt+-";
                       command = "workbench.action.navigateBack";
@@ -198,19 +167,18 @@
         };
       in
       {
-        # Чтобы можно было применять home-manager конфиг через flake
+        # home-manager через flake
         packages.homeConfigurations.default = homeConfig.activationPackage;
 
         devShells.default = pkgs.mkShell {
           packages = [
-            python
-            pythonEnv
-
+            python              # только интерпретатор 3.11
             pkgs.uv
             pkgs.git
             pkgs.gcc
             pkgs.pkg-config
 
+            # системные зависимости для OpenCV/TF/Jupyter
             pkgs.opencv4
             pkgs.gtk3
             pkgs.zeromq
@@ -237,25 +205,26 @@
             export PYTHONPATH="${pkgs.opencv4}/${python.sitePackages}:$PYTHONPATH"
 
             if [ ! -d ".venv" ]; then
-              echo "Creating uv virtual environment with Python 3.13..."
+              echo "Creating uv virtual environment with Python 3.11..."
               uv venv --python ${python}/bin/python .venv
             fi
 
             source .venv/bin/activate
 
-            echo "Installing packages that should stay in the venv..."
+            echo "Installing base pip tooling in .venv..."
             uv pip install --upgrade pip setuptools wheel
 
+            # TensorFlow CPU для Python 3.11 (по возможности зафиксируй версию в requirements)
             if ! python -c "import tensorflow" >/dev/null 2>&1; then
-              echo "Installing TensorFlow CPU wheel into .venv..."
-              uv pip install tensorflow_cpu-2.21.0-cp313-cp313-linux_x86_64.whl
+              echo "Installing TensorFlow CPU via pip into .venv..."
+              uv pip install "tensorflow-text"
             fi
 
+            # Jupyter/kernel infra
             uv pip install pyzmq jupyter-client ipykernel
 
             mkdir -p .vscode
 
-            # Workspace-local settings (могут переопределять глобальные, если нужно)
             cat > .vscode/settings.json << EOF
 {
   "python.defaultInterpreterPath": "''${workspaceFolder}/.venv/bin/python",
@@ -280,8 +249,7 @@
 
   "python.envFile": "''${workspaceFolder}/.env",
   "python.analysis.extraPaths": [
-    "${pkgs.opencv4}/${python.sitePackages}",
-    "${pkgs.python313Packages.opencv4}/${python.sitePackages}"
+    "${pkgs.opencv4}/${python.sitePackages}"
   ],
 
   "python.linting.enabled": true,
@@ -323,7 +291,6 @@
 }
 EOF
 
-            # Workspace keybindings: дублируют профиль, если запуск без home-manager
             cat > .vscode/keybindings.json << EOF
 [
   {
@@ -364,7 +331,7 @@ LD_LIBRARY_PATH=${libPath}
 PYTHONPATH=${pkgs.opencv4}/${python.sitePackages}
 EOF
 
-            KERNEL_DIR="$HOME/.local/share/jupyter/kernels/python313-venv"
+            KERNEL_DIR="$HOME/.local/share/jupyter/kernels/python311-venv"
             mkdir -p "$KERNEL_DIR"
 
             cat > "$KERNEL_DIR/kernel.json" << EOF
@@ -376,7 +343,7 @@ EOF
     "-f",
     "{connection_file}"
   ],
-  "display_name": "Python 3.13 (.venv + Nix OpenCV)",
+  "display_name": "Python 3.11 (.venv + Nix OpenCV)",
   "language": "python",
   "env": {
     "LD_LIBRARY_PATH": "${libPath}",
@@ -390,9 +357,8 @@ EOF
             echo "║  Dev environment ready                                        ║"
             echo "║                                                                ║"
             echo "║  • Python: $(python --version)                                 ║"
-            echo "║  • Virtual env: .venv (activated)                              ║"
+            echo "║  • Virtual env: .venv (activated, TF via pip)                  ║"
             echo "║  • OpenCV: from Nix package                                    ║"
-            echo "║  • TensorFlow: from .venv wheel                                ║"
             echo "║  • VSCodium: Alt menu focus disabled                           ║"
             echo "║  • Alt+Left/Right: history (editor) / panes (terminal)         ║"
             echo "╚════════════════════════════════════════════════════════════════╝"
