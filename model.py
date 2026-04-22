@@ -304,29 +304,6 @@ def make_batches(ds, prepare_batch):
 def create_or_load_model(tokenizers):
     from config import NUM_LAYERS, D_MODEL, NUM_HEADS, DFF, DROPOUT_RATE
 
-    if TRAINED_MODEL_PATH.exists():
-        logger.info(f"Загружаем существующую модель из {TRAINED_MODEL_PATH}")
-        model = tf.keras.models.load_model(
-            str(TRAINED_MODEL_PATH),
-            custom_objects={
-                "Transformer": Transformer,
-                "CustomSchedule": CustomSchedule,
-                "masked_loss": masked_loss,
-                "masked_accuracy": masked_accuracy,
-                "Encoder": Encoder,
-                "Decoder": Decoder,
-                "EncoderLayer": EncoderLayer,
-                "DecoderLayer": DecoderLayer,
-                "PositionalEmbedding": PositionalEmbedding,
-                "GlobalSelfAttention": GlobalSelfAttention,
-                "CausalSelfAttention": CausalSelfAttention,
-                "CrossAttention": CrossAttention,
-                "FeedForward": FeedForward,
-            },
-        )
-        return model
-
-    logger.info("Модель не найдена, создаём новую.")
     input_vocab_size = int(tokenizers.question.get_vocab_size().numpy())
     target_vocab_size = int(tokenizers.answer.get_vocab_size().numpy())
 
@@ -350,5 +327,16 @@ def create_or_load_model(tokenizers):
         optimizer=optimizer,
         metrics=[masked_accuracy],
     )
+
+    # build model before load_weights
+    dummy_context = tf.zeros((1, MAX_TOKENS), dtype=tf.int64)
+    dummy_target = tf.zeros((1, MAX_TOKENS), dtype=tf.int64)
+    _ = model((dummy_context, dummy_target))
+
+    if TRAINED_MODEL_PATH.exists():
+        logger.info(f"Загружаем существующие веса из {TRAINED_MODEL_PATH}")
+        model.load_weights(str(TRAINED_MODEL_PATH))
+    else:
+        logger.info("Веса модели не найдены, используем новую инициализацию.")
 
     return model

@@ -11,7 +11,7 @@ ANSWER_VOCAB_PATH = PROJECT_ROOT / "answer_vocab.txt"
 
 TOKENIZERS_SAVEDMODEL_DIR = PROJECT_ROOT / "russian_dialogues_qa_converter"
 # TRAINED_MODEL_DIR = PROJECT_ROOT / "trained_transformer"
-TRAINED_MODEL_PATH = PROJECT_ROOT / "trained_transformer.keras"
+TRAINED_MODEL_PATH = PROJECT_ROOT / "trained_transformer.weights.h5"
 
 EXPORTED_TRANSLATOR_DIR = PROJECT_ROOT / "translator"
 # EXPORTED_TRANSLATOR_DIR = PROJECT_ROOT / "russian_dialogues_qa_converter"
@@ -37,6 +37,7 @@ DROPOUT_RATE = 0.1
 EPOCHS = 1
 BUFFER_SIZE = 20000
 BATCH_SIZE = 64
+TRUNCATE_DATASET_FOR_DEBUG=-1
 
 # Логирование
 LOG_LEVEL = "INFO"
