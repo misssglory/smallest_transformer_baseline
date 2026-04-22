@@ -137,8 +137,6 @@ def main():
     if TRUNCATE_DATASET_FOR_DEBUG > 0:
         train_batches = train_batches.take(TRUNCATE_DATASET_FOR_DEBUG)
 
-    logger.info(f"Train batches size: {len(list(train_batches))}")
-
     history = transformer.fit(
         train_batches.take(3333),
         epochs=EPOCHS,
